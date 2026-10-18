@@ -1,3 +1,5 @@
+import { isProxy } from "node:util/types";
+
 import type { JsonValue } from "./jsonValue.js";
 
 const immutableSnapshots = new WeakSet<object>();
@@ -13,6 +15,70 @@ export const isImmutableJsonSnapshot = (value: unknown): value is JsonValue =>
   typeof value === "boolean" ||
   (typeof value === "number" && Number.isFinite(value)) ||
   (typeof value === "object" && immutableSnapshots.has(value));
+
+/** Borrow one own member of a completed snapshot, carrying its sealing proof. */
+export const immutableJsonSnapshotMember = (
+  snapshot: unknown,
+  key: string,
+): JsonValue | undefined => {
+  if (
+    typeof snapshot !== "object" ||
+    snapshot === null ||
+    !immutableSnapshots.has(snapshot)
+  )
+    return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(snapshot, key);
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value"))
+    return undefined;
+  // Completed sealing checked and froze every reachable member. Register only
+  // the selected child; do not traverse it again or add per-node weak entries.
+  const member = descriptor.value as JsonValue;
+  if (typeof member === "object" && member !== null)
+    immutableSnapshots.add(member);
+  return member;
+};
+
+/** Match a completed snapshot to its parsed representation without recursion. */
+export const canBorrowParsedJsonSnapshot = <Parsed extends JsonValue>(
+  source: unknown,
+  parsed: Parsed,
+): source is Parsed => {
+  if (!isImmutableJsonSnapshot(source)) return false;
+  const pending: unknown[] = [source, parsed];
+  while (pending.length > 0) {
+    const right = pending.pop();
+    const left = pending.pop();
+    if (Object.is(left, right)) continue;
+    if (
+      typeof left !== "object" ||
+      left === null ||
+      typeof right !== "object" ||
+      right === null ||
+      isProxy(right) ||
+      Object.getPrototypeOf(left) !== Object.getPrototypeOf(right)
+    )
+      return false;
+    const keys = Reflect.ownKeys(left);
+    if (keys.length !== Reflect.ownKeys(right).length) return false;
+    for (const key of keys) {
+      // A parser may drop hidden fields or normalize enumerability. Generic
+      // deep equality omits these differences and can borrow unparsed data.
+      if (typeof key !== "string") return false;
+      const a = Object.getOwnPropertyDescriptor(left, key);
+      const b = Object.getOwnPropertyDescriptor(right, key);
+      if (
+        a === undefined ||
+        b === undefined ||
+        !Object.hasOwn(a, "value") ||
+        !Object.hasOwn(b, "value") ||
+        a.enumerable !== b.enumerable
+      )
+        return false;
+      pending.push(a.value as unknown, b.value as unknown);
+    }
+  }
+  return true;
+};
 
 /** Seal an already parsed, owned JSON snapshot for immutable zero-copy reuse. */
 export const freezeJsonSnapshot = <T extends JsonValue>(value: T): T => {
@@ -104,6 +170,8 @@ export function* freezeOwnedJsonSnapshotSteps<T extends JsonValue>(
 }
 
 const pushSnapshotChildren = (item: object, pending: SnapshotEntry[]): void => {
+  if (isProxy(item))
+    throw new TypeError("Immutable JSON snapshots cannot contain proxies");
   const prototype: unknown = Object.getPrototypeOf(item);
   if (
     !Array.isArray(item) &&

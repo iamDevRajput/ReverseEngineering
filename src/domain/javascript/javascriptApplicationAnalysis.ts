@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { canBorrowParsedJsonSnapshot } from "../immutableJson.js";
 
 import {
   javascriptApplicationGraphSchema,
@@ -172,21 +173,43 @@ const ownedAnalysisResultShape = applicationAnalysisResultShape.extend({
   ),
 });
 
+// One successful interpretation per exact immutable source. Weak keys retain
+// neither a second graph nor a source beyond its Evidence lifetime.
+const validatedImmutableResults = new WeakSet<object>();
+const isValidatedImmutableResult = (
+  input: unknown,
+): input is JavaScriptApplicationAnalysisResult =>
+  typeof input === "object" &&
+  input !== null &&
+  validatedImmutableResults.has(input);
+
 /** Reuse exact owned graphs while validating metadata and cross-graph bindings. */
 export function* parseOwnedJavaScriptApplicationAnalysisSteps(
   input: unknown,
 ): Generator<void, JavaScriptApplicationAnalysisResult> {
+  if (isValidatedImmutableResult(input)) return input;
   const prepared = ownedAnalysisResultShape.safeParse(input);
+  let result: JavaScriptApplicationAnalysisResult;
   if (!prepared.success)
-    return javascriptApplicationAnalysisResultSchema.parse(input);
-  const issues: BindingIssue[] = [];
-  yield* checkApplicationBindingsSteps(prepared.data, {
-    addIssue: (issue) => {
-      issues.push(issue);
-    },
-  });
-  if (issues.length > 0) throw new z.ZodError(issues);
-  return prepared.data;
+    result = javascriptApplicationAnalysisResultSchema.parse(input);
+  else {
+    const issues: BindingIssue[] = [];
+    yield* checkApplicationBindingsSteps(prepared.data, {
+      addIssue: (issue) => {
+        issues.push(issue);
+      },
+    });
+    if (issues.length > 0) throw new z.ZodError(issues);
+    result = prepared.data;
+  }
+  // Borrow only if parsing preserved the exact representation. A future schema
+  // default/normalization must still return its parsed value, without caching.
+  // Admission follows full validation, including completion of yielding checks.
+  if (canBorrowParsedJsonSnapshot(input, result)) {
+    validatedImmutableResults.add(input);
+    return input;
+  }
+  return result;
 }
 
 /** Parsed public JavaScript application analysis request. */
