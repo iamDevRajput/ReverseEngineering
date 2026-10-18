@@ -562,6 +562,13 @@ that explicit lane, not the routine iteration requirement.
 
 ## Real-toolchain verification lanes
 
+For one-shot Rizin profile changes, set `REA_RIZIN_COMMAND` to a real Rizin
+executable and run `npm run test:focused -- tests/boundary/mcp/reverseEngineeringEnvironmentMcp.test.ts`.
+The real-engine cases compare MCP Evidence with direct Rizin output for default
+disassembly, explicitly enabled color, and JSON bytes. They skip when the variable
+is unset; the controlled provider-environment cases do not establish real-engine
+behavior. Record the installed Rizin version with the verification results.
+
 Linux Rizin debugger ownership changes require a separate real-provider gate on
 Rizin 0.7.4. Run
 `npm run test:focused -- tests/boundary/providers/RizinInferiorTty.test.ts`.

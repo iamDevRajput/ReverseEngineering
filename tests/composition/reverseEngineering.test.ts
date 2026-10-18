@@ -308,7 +308,7 @@ describe("Rizin command service", () => {
       expect(calls).toEqual([
         {
           command: "/tools/rizin",
-          args: ["-N", "-q", "-c", "iI", path],
+          args: ["-N", "-q", "-e", "scr.color=0", "-c", "iI", path],
         },
       ]);
       expect(result.value.raw_result).toMatchObject({

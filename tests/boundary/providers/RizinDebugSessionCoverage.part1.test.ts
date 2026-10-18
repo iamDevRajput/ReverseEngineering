@@ -32,6 +32,8 @@ it.skipIf(process.platform === "win32")(
     expect(rizinCommand({ path: "./sample file", command: "izz" })).toEqual([
       "-N",
       "-q",
+      "-e",
+      "scr.color=0",
       "-c",
       "izz",
       expect.stringMatching(/sample file/u),

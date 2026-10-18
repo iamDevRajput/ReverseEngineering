@@ -50,7 +50,7 @@ Persistent command Evidence retains the caller-selected and resolved startup pat
 rea debug-with-rizin --inferior-tty /dev/pts/7 ./program dr
 ```
 
-`execute_rizin_command` and `rea execute-rizin-command` run one selected command against a local artifact. The one-shot profile uses `-N -q -c`, suppressing user settings and scripts while leaving plugins available. Commands and plugins run with the REA process user's security context and may access files, the network, or perform other actions. REA preserves raw output and does not claim that command-specific JSON has one universal schema.
+`execute_rizin_command` and `rea execute-rizin-command` run one selected command against a local artifact. The one-shot profile uses `-N -q -e scr.color=0 -c`, suppressing user settings and scripts while leaving plugins available and disabling color by default. A caller can explicitly re-enable color in the command with `e scr.color=1; ...`; REA preserves that output, including ANSI escapes, and records the startup options in Evidence `parameters.command_arguments`. Commands and plugins run with the REA process user's security context and may access files, the network, or perform other actions. REA preserves raw output and does not claim that command-specific JSON has one universal schema.
 
 ```sh
 rea execute-rizin-command ./program iI

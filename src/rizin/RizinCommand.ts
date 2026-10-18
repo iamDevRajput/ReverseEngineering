@@ -11,6 +11,8 @@ export const RIZIN_PROVIDER_IDENTITY = {
 export const rizinCommand = (input: RizinInput): readonly string[] => [
   "-N",
   "-q",
+  "-e",
+  "scr.color=0",
   "-c",
   input.command,
   absoluteCallerPath(input.path),

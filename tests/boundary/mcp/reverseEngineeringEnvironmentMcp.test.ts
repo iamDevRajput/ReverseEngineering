@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,6 +7,7 @@ import { join } from "node:path";
 import type { Client } from "@modelcontextprotocol/client";
 import { expect, it } from "vitest";
 
+import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { createProviderEnvironmentMcpHarness } from "../../support/reverseDebuggerMcpTestHelpers.js";
 
 const writeProvider = async (path: string, output: string): Promise<void> => {
@@ -118,4 +121,56 @@ it("snapshots an explicit provider environment when the server is created", asyn
   expect(JSON.stringify(response.structuredContent)).not.toContain(
     '"captured"',
   );
+});
+
+const realRizin = process.env.REA_RIZIN_COMMAND;
+
+it.skipIf(realRizin === undefined).each([
+  {
+    name: "default disassembly",
+    command: "e asm.arch=x86; e asm.bits=64; pd 2",
+    colored: false,
+  },
+  {
+    name: "explicit color",
+    command: "e scr.color=1; e asm.arch=x86; e asm.bits=64; pd 2",
+    colored: true,
+  },
+  { name: "JSON bytes", command: "pxj 2", colored: false },
+])("preserves real Rizin output with $name", async ({ command, colored }) => {
+  if (realRizin === undefined) throw new Error("REA_RIZIN_COMMAND is required");
+  const directory = await createTestTempDirectory("rea-rizin-color-");
+  const artifact = join(directory, "instructions.bin");
+  await writeFile(artifact, Buffer.from([0x90, 0xc3]));
+  const { client } = await connectProviderClient({
+    directory,
+    clientName: "rizin-color-test",
+    configuredProvider: realRizin,
+    providerEnvironment: { ...process.env, REA_RIZIN_COMMAND: realRizin },
+  });
+  const args = ["-N", "-q", "-e", "scr.color=0", "-c", command, artifact];
+  const direct = await promisify(execFile)(realRizin, args, {
+    timeout: 10_000,
+  });
+  expect(direct.stdout.includes("\u001b[")).toBe(colored);
+  if (command === "pxj 2")
+    expect(JSON.parse(direct.stdout)).toEqual([0x90, 0xc3]);
+  else {
+    expect(direct.stdout).toContain("nop");
+    expect(direct.stdout).toContain("ret");
+  }
+  const response = await client.callTool({
+    name: "execute_rizin_command",
+    arguments: { path: artifact, command },
+  });
+  expect(response.isError).not.toBe(true);
+  expect(response.structuredContent).toMatchObject({
+    parameters: { command, command_arguments: args },
+    raw_result: { stdout: direct.stdout, stderr: direct.stderr, exit_code: 0 },
+    normalized_result: {
+      stdout: direct.stdout,
+      stderr: direct.stderr,
+      exit_code: 0,
+    },
+  });
 });
