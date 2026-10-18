@@ -25,6 +25,8 @@ interface StatementPosition {
 interface BindingReadPosition {
   readonly position: StatementPosition | null;
   readonly repeating: boolean;
+  /** Enclosing statements in this activation also prove initializer coverage. */
+  readonly outer?: BindingReadPosition;
 }
 
 interface ExpressionSiblings {
@@ -591,10 +593,6 @@ const bindingReadPosition = (
     }
     path.push(current);
     const parent = parents.get(current);
-    if (t.isLoop(parent)) {
-      result = { position: null, repeating: true };
-      break;
-    }
     if (
       parent === undefined ||
       t.isFunction(parent) ||
@@ -609,19 +607,17 @@ const bindingReadPosition = (
     const node = path[index];
     if (node === undefined) continue;
     const parent = parents.get(node);
+    if (t.isLoop(parent) && !result.repeating)
+      result = { ...result, repeating: true };
     let position: StatementPosition | null = null;
     if (t.isVariableDeclarator(parent)) {
       const declaration = parents.get(parent);
       if (t.isVariableDeclaration(declaration))
         position = statementPosition(declaration, parents, parent);
-    } else if (
-      t.isStatement(parent) &&
-      !t.isLoop(parent) &&
-      !t.isFunction(parent)
-    )
+    } else if (t.isStatement(parent) && !t.isFunction(parent))
       position = statementPosition(parent, parents);
     if (position !== null && position !== result.position)
-      result = { ...result, position };
+      result = { position, repeating: result.repeating, outer: result };
     cache.set(node, result);
   }
   return result;
@@ -655,19 +651,33 @@ export const semanticBindingAtRead = (
         ? null
         : initializerPosition(reference, parents, true)
       : initializerPosition(initializer, parents);
-  const { position, repeating } = bindingReadPosition(read, parents);
+  const readPosition = bindingReadPosition(read, parents);
+  const { position, repeating } = readPosition;
   // Coverage and latest-value selection are independent. A preceding write
   // can cover entry even when another write's order remains unknown.
-  const hasDefiniteInitializer =
-    position !== null &&
-    binding.initializers.some((initializer) => {
-      const source = initializerPosition(initializer, parents);
-      return (
-        source !== null &&
-        positionPrecedes(source, position) &&
-        !initializerMayRetainEntry(initializer, binding, parents)
-      );
-    });
+  const hasDefiniteInitializer = binding.initializers.some((initializer) => {
+    const source = initializerPosition(initializer, parents);
+    if (
+      source === null ||
+      initializerMayRetainEntry(initializer, binding, parents)
+    )
+      return false;
+    // A prior enclosing-block initializer covers nested reads, including
+    // loop iterations. Crossing a function or delayed field still stops
+    // the position chain; coverage does not establish latest-value order.
+    for (
+      let context: BindingReadPosition | undefined = readPosition;
+      context !== undefined;
+      context = context.outer
+    ) {
+      if (
+        context.position !== null &&
+        positionPrecedes(source, context.position)
+      )
+        return true;
+    }
+    return false;
+  });
   if (
     !repeating &&
     origin !== undefined &&
