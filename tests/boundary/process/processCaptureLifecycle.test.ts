@@ -176,13 +176,10 @@ itWithCaptureCapability(
   "keeps the process deadline bounded when the wall clock moves backward",
   async () => {
     const wallStart = Date.now();
-    let wallReads = 0;
-    const now = vi.spyOn(Date, "now").mockImplementation(() => {
-      wallReads += 1;
-      return wallReads === 1 ? wallStart : wallStart - 60_000 + wallReads;
-    });
+    const now = vi.spyOn(Date, "now").mockReturnValue(wallStart);
     const controller = new AbortController();
-    const fallback = setTimeout(() => controller.abort(), 1_500);
+    let fallback: ReturnType<typeof setTimeout> | undefined;
+    let runningObserved = false;
     try {
       const result = await captureProcessScenario(
         parseProcessScenario({
@@ -193,9 +190,29 @@ itWithCaptureCapability(
           idle_timeout_ms: 5_000,
         }),
         controller.signal,
+        process.platform,
+        process.env,
+        undefined,
+        undefined,
+        {
+          async report(update) {
+            if (update.phase === "running" && !runningObserved) {
+              runningObserved = true;
+              // Roll back after the workload start time was recorded. Only
+              // execution belongs to this watchdog, not setup or final cleanup.
+              now.mockReturnValue(wallStart - 60_000);
+              fallback = setTimeout(() => controller.abort(), 1_500);
+            } else if (
+              update.phase === "settling" ||
+              update.terminal === true
+            ) {
+              clearTimeout(fallback);
+            }
+          },
+        },
       );
-      expect(result.ok).toBe(true);
       if (!result.ok) throw result.error;
+      expect(runningObserved).toBe(true);
       expect(result.value.exit.reason).toBe("timeout");
     } finally {
       clearTimeout(fallback);

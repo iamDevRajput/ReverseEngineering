@@ -132,7 +132,9 @@ explicit path or endpoint and do not need it.
   Packet limits count input packets before filtering. Output defaults to 50 matching
   frames; use `match_offset` / `match_limit` for later pages, or explicit null
   limit for complete matching output. Preserve the source digest across pages.
-  This does not perform live capture.
+  This does not perform live capture. For HTTPS recorded with the caller's own
+  client key log (`SSLKEYLOGFILE`), add `tls_key_log_path`; only key-log counts
+  are returned and known authorization/cookie fields are listed in `redactions`.
   For address/DNS/SNI/protocol summaries use `inspect_pcap_capture` with MCP
   detail summary, then retained kind pcap pages. Requires Wireshark 4.x tshark
   and capinfos, with Linux prlimit or Windows Job Objects; see

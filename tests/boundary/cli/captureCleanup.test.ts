@@ -1,4 +1,5 @@
 import { Cli } from "incur";
+import { resolve } from "node:path";
 import { expect, it } from "vitest";
 import { registerCaptureCommands } from "../../../src/cli/captureCommands.js";
 import { silentLogger } from "../../../src/logger.js";
@@ -248,4 +249,49 @@ it("rejects conflicting output options before the CLI invokes its service", asyn
     "json",
   ]);
   expect(stdout).toContain("mutually exclusive");
+});
+
+it("resolves a CLI key-log path and forwards it only when selected", async () => {
+  const inputs: unknown[] = [];
+  const cli = Cli.create("capture-key-log-test", { sync: false });
+  registerCaptureCommands(
+    cli,
+    silentLogger,
+    {},
+    {
+      inspectFields: async () => {
+        throw new Error("Unexpected field discovery call");
+      },
+      inspect: async (input) => {
+        inputs.push(input);
+        return err(
+          new AnalysisInputError("inspect_packet_capture", {
+            userMessage: "Recorded request.",
+          }),
+        );
+      },
+      close: async () => {},
+    },
+  );
+  for (const extra of [["--tls_key_log_path", "client.keys"], []])
+    await cli.serve(
+      [
+        "inspect-packet-capture",
+        "recording.pcap",
+        "--fields",
+        "http2.headers.path",
+        ...extra,
+        "--format",
+        "json",
+      ],
+      { stdout: () => {}, exit: () => {} },
+    );
+  expect(inputs).toEqual([
+    expect.objectContaining({
+      path: resolve("recording.pcap"),
+      tls_key_log_path: resolve("client.keys"),
+    }),
+    expect.objectContaining({ path: resolve("recording.pcap") }),
+  ]);
+  expect(Object.keys(inputs[1] ?? {})).not.toContain("tls_key_log_path");
 });

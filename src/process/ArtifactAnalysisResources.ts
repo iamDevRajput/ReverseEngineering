@@ -329,6 +329,8 @@ export class ArtifactAnalysisResources {
     },
     effectiveLimits: LinuxResourceLimits | undefined,
     operation = this.operation,
+    /** The provider withheld output text; keep the observed stream sizes. */
+    outputWithheld = false,
   ): AnalysisError {
     const capturedOutput =
       cause.snapshot === null
@@ -339,6 +341,12 @@ export class ArtifactAnalysisResources {
             truncated: cause.snapshot.diagnosticTruncated ?? false,
             exit_code: cause.snapshot.exitCode ?? null,
             signal: cause.snapshot.signal ?? null,
+            ...(outputWithheld
+              ? {
+                  stdout_bytes: cause.snapshot.stdout.observedBytes,
+                  stderr_bytes: cause.snapshot.stderr.observedBytes,
+                }
+              : {}),
           };
     const detail = {
       cause,

@@ -160,3 +160,51 @@ it("rejects oversized selector expansion through the MCP boundary before invokin
   expect(JSON.stringify(response)).toContain("32 KiB");
   expect(calls).toBe(0);
 });
+
+it("advertises and forwards an optional absolute TLS key log through MCP", async () => {
+  const inputs: unknown[] = [];
+  const packetCapture = new PacketCaptureService({
+    inspectFields: async () => {
+      throw new Error("Unexpected field discovery call");
+    },
+    inspect: async (input) => {
+      inputs.push(input);
+      return err(new AnalysisCancelledError("inspect_packet_capture"));
+    },
+    close: async () => {},
+  });
+  const harness = await createApplicationMcpHarness({
+    serverOptions: { packetCapture },
+  });
+  onTestFinished(harness.close);
+  const tool = (await harness.client.listTools()).tools.find(
+    ({ name }) => name === "inspect_packet_capture",
+  );
+  if (tool?.outputSchema === undefined) throw new Error("Capture tool missing");
+  const absolute = (name: string) =>
+    process.platform === "win32"
+      ? `C:\\captures\\${name}`
+      : `/captures/${name}`;
+  const input = {
+    path: absolute("recording.pcapng"),
+    fields: ["http2.headers.path"],
+    tls_key_log_path: absolute("client.keys"),
+  };
+  const ajv = new Ajv2020({ strict: false, validateFormats: false });
+  expect(ajv.validate(tool.inputSchema, input)).toBe(true);
+  expect(
+    ajv.validate(tool.inputSchema, { ...input, tls_key_log_path: "" }),
+  ).toBe(false);
+  const outputProperties = JSON.stringify(tool.outputSchema);
+  expect(outputProperties).toContain("tls_key_log");
+  expect(outputProperties).toContain("redactions");
+  await harness.client.callTool({ name: tool.name, arguments: input });
+  expect(inputs).toEqual([expect.objectContaining(input)]);
+  const relative = await harness.client.callTool({
+    name: tool.name,
+    arguments: { ...input, tls_key_log_path: "client.keys" },
+  });
+  expect(relative.isError).toBe(true);
+  expect(JSON.stringify(relative)).toContain("tls_key_log_path");
+  expect(inputs).toHaveLength(1);
+});

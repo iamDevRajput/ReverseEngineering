@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import type { IPty } from "@lydell/node-pty";
 
 import { parseProcessScenario } from "../../domain/process/processScenario.js";
@@ -92,6 +92,32 @@ const start = (
     dispatchedEventIndexes: new Set<number>(),
     recordEvent: () => undefined,
   });
+
+it.each([-60_000, 60_000])(
+  "keeps the execution deadline when the wall clock jumps by %i ms",
+  async (jump) => {
+    vi.useFakeTimers({
+      toFake: ["Date", "performance", "setInterval", "clearInterval"],
+    });
+    const fake = fakeTerminal();
+    const pending = start(fake, { timeout_ms: 100 });
+    try {
+      await vi.advanceTimersByTimeAsync(40);
+      vi.setSystemTime(Date.now() + jump);
+      await vi.advanceTimersByTimeAsync(59);
+      expect(fake.signals).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fake.signals).toEqual(["terminal:SIGKILL"]);
+      fake.deliverExit({ exitCode: 0, signal: 9 });
+      expect(observed(await pending).reason).toBe("timeout");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      fake.deliverExit({ exitCode: 0, signal: 9 });
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  },
+);
 
 it("records attempts when a self-exit notification arrives after escalation", async () => {
   const fake = fakeTerminal();

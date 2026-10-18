@@ -20,6 +20,7 @@ import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.
 import {
   inspectPacketCaptureInputSchema,
   packetCaptureSchema,
+  packetCaptureSelection,
   type InspectPacketCaptureInput,
 } from "../../domain/captures/packetCapture.js";
 import { err, ok, type Result } from "../../domain/result.js";
@@ -59,17 +60,24 @@ export class PacketCaptureService {
           cause: input.error,
         }),
       );
-    if (!isAbsolute(input.data.path))
+    const relative = (["path", "tls_key_log_path"] as const).filter((field) => {
+      const value = input.data[field];
+      return value !== undefined && !isAbsolute(value);
+    });
+    if (relative.length > 0)
       return err(
-        new AnalysisInputError(operation, undefined, [
-          {
-            path: ["path"],
+        new AnalysisInputError(
+          operation,
+          undefined,
+          relative.map((field) => ({
+            path: [field],
             reason: "invalid_format",
             message: "Expected an absolute local path.",
-          },
-        ]),
+          })),
+        ),
       );
-    const decoded = await this.provider.inspect(input.data, options);
+    const selection = packetCaptureSelection(input.data);
+    const decoded = await this.provider.inspect(selection, options);
     if (!decoded.ok) return decoded;
     const execution = decoded.value;
     const report = packetCaptureSchema.safeParse(execution.result);
@@ -78,7 +86,7 @@ export class PacketCaptureService {
       report.data.artifact.path !== input.data.path ||
       execution.subject?.path !== input.data.path ||
       execution.subject.sha256 !== report.data.artifact.sha256 ||
-      JSON.stringify(report.data.selection) !== JSON.stringify(input.data)
+      JSON.stringify(report.data.selection) !== JSON.stringify(selection)
     )
       return err(
         new AnalysisOutputError(
@@ -86,7 +94,7 @@ export class PacketCaptureService {
           "Capture analyzer returned malformed data or changed the selected artifact identity/options.",
         ),
       );
-    return this.#evidence(operation, input.data, execution, options);
+    return this.#evidence(operation, selection, execution, options);
   }
   async inspectFields(
     raw: unknown,

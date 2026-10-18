@@ -1,8 +1,20 @@
 import { packetFieldsCatalogSchema } from "../../../src/domain/captures/packetFields.js";
 import { OwnedCommandFailure } from "../../../src/process/OwnedCommand.js";
 import { it, expect, onTestFinished } from "vitest";
-import { writeFile, readdir, chmod, symlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  writeFile,
+  readdir,
+  chmod,
+  symlink,
+  mkdir,
+  truncate,
+} from "node:fs/promises";
 import { join } from "node:path";
+import { inspect } from "node:util";
+import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
+import { TLS_KEY_LOG_MAX_BYTES } from "../../../src/domain/captures/tlsKeyLog.js";
 import { readStableArtifact } from "../../../src/artifacts/readStableArtifact.js";
 import { TsharkCaptureProvider } from "../../../src/captures/TsharkCaptureProvider.js";
 import { PacketCaptureService } from "../../../src/application/captures/PacketCaptureService.js";
@@ -15,16 +27,67 @@ import { Cli } from "incur";
 import { registerCaptureCommands } from "../../../src/cli/captureCommands.js";
 import { silentLogger } from "../../../src/logger.js";
 
+// Synthetic NSS key log: hex tokens are fixture values, never real session secrets.
+const keyLogTokens = {
+  randomA: "a1".repeat(32),
+  randomB: "b2".repeat(32),
+  master: "c3".repeat(48),
+  traffic: "d4".repeat(32),
+};
+const keyLogText = [
+  "# fixture key log",
+  `CLIENT_RANDOM ${keyLogTokens.randomA} ${keyLogTokens.master}`,
+  `CLIENT_TRAFFIC_SECRET_0 ${keyLogTokens.randomB} ${keyLogTokens.traffic}`,
+  `SERVER_TRAFFIC_SECRET_0 ${keyLogTokens.randomB} ${keyLogTokens.traffic}`,
+  `NOT_A_LABEL ${keyLogTokens.randomB} ${keyLogTokens.traffic}`,
+  "",
+].join("\r\n");
+const decryptedCredentials = ["Bearer fixture-token", "session=fixture"];
+const decryptedFrame = {
+  "frame.number": ["4"],
+  "http2.headers.path": ["/v1/items"],
+  "http2.headers.authorization": [decryptedCredentials[0]],
+  "http.cookie": [decryptedCredentials[1]],
+};
+const keyLogFields = [
+  "http2.headers.path",
+  "http2.headers.authorization",
+  "http.cookie",
+];
+const expectNoKeyLogOrCredentialText = (value: unknown) => {
+  const serialized = inspect(value, {
+    depth: null,
+    maxArrayLength: null,
+    maxStringLength: null,
+  }).toLowerCase();
+  for (const token of [...Object.values(keyLogTokens), ...decryptedCredentials])
+    expect(serialized).not.toContain(token.toLowerCase());
+  expect(serialized).not.toContain("not_a_label");
+};
+
 // A command-boundary simulator: real process ownership/filesystem, not real TShark coverage.
 const fixture = async (mode = "ok", failCleanup = false) => {
   const directory = await createTestTempDirectory("rea-capture-test-");
   const path = join(directory, "recorded bytes.pcap");
   await writeFile(path, "recording bytes");
+  const keyLogPath = join(directory, "client keys.log");
+  await writeFile(keyLogPath, keyLogText);
   const script = join(directory, "producer.mjs");
   await writeFile(
     script,
-    `import {readFileSync, writeFileSync, chmodSync, truncateSync} from 'node:fs';
+    `import {readFileSync, writeFileSync, chmodSync, statSync, truncateSync, realpathSync} from 'node:fs';
+import {basename, dirname, isAbsolute} from 'node:path';
+const keyLog = () => { const value = process.argv[process.argv.indexOf('-o') + 1] ?? ''; const copy = value.slice('tls.keylog_file:'.length); if (!value.startsWith('tls.keylog_file:') || !isAbsolute(copy) || basename(copy) !== 'tls-key-log' || realpathSync(dirname(copy)) !== realpathSync('.')) throw Error('missing absolute key log preference'); if ((statSync(copy).mode & 0o777) !== 0o400 || readFileSync(copy, 'latin1') !== ${JSON.stringify(keyLogText)}) throw Error('wrong key log copy'); };
+const decrypted = JSON.stringify([{_source:{layers:${JSON.stringify(decryptedFrame)}}}]);
 if (process.argv.includes('--version')) { console.log(${JSON.stringify(mode)} === 'bad-version' ? 'TShark (Wireshark) 3.0.0' : 'TShark (Wireshark) 4.6.9 (fixture)'); console.error('version warning'); }
+else if (${JSON.stringify(mode)} === 'keylog') { keyLog(); console.log(decrypted); console.error('producer warning'); }
+else if (${JSON.stringify(mode)} === 'keylog-mutate') { keyLog(); chmodSync('tls-key-log', 0o600); writeFileSync('tls-key-log', 'changed'); console.log(decrypted); }
+else if (${JSON.stringify(mode)} === 'keylog-nonzero') { keyLog(); console.log(decrypted); console.error('invalid decoder'); process.exitCode = 1; }
+else if (${JSON.stringify(mode)} === 'keylog-invalid-json') { keyLog(); console.log(decrypted.slice(0, -1) + ' Bearer fixture-token'); }
+else if (${JSON.stringify(mode)} === 'keylog-pin') { keyLog(); chmodSync('.', 0o500); console.log(decrypted); }
+else if (${JSON.stringify(mode)} === 'keylog-abort') { keyLog(); console.log(decrypted); }
+else if (${JSON.stringify(mode)} === 'keylog-overflow') { keyLog(); process.stdout.write(decrypted + 'x'.repeat(5 * 1024 * 1024)); }
+else if (${JSON.stringify(mode)} === 'keylog-wait') { keyLog(); console.log(decrypted); console.error('producer warning'); setInterval(() => {}, 1000); }
 else if (${JSON.stringify(mode)} === 'nonzero') { console.error('invalid decoder'); process.exitCode = 1; }
 else if (${JSON.stringify(mode)} === 'malformed-copy') { chmodSync('capture', 0o600); writeFileSync('capture', 'changed'); }
 else if (${JSON.stringify(mode)} === 'oversized-copy') { chmodSync('capture', 0o600); truncateSync('capture', 32 * 1024 * 1024 + 1); console.log('[]'); }
@@ -43,6 +106,7 @@ else { if(readFileSync('capture', 'utf8') !== 'recording bytes') throw Error('wr
   const controller = new AbortController();
   let calls = 0;
   let mayClean = !failCleanup;
+  const keyLogCopiesAtClose: boolean[] = [];
   const acquired = createDeferred<void>();
   const release = createDeferred<void>();
   const provider = new TsharkCaptureProvider(
@@ -75,7 +139,10 @@ else { if(readFileSync('capture', 'utf8') !== 'recording bytes') throw Error('wr
         arguments: [script, ...input.arguments],
         expectedCommand: process.execPath,
       });
-      if (mode === "wait" && !input.arguments.includes("--version"))
+      if (
+        (mode === "wait" || mode === "keylog-wait") &&
+        !input.arguments.includes("--version")
+      )
         spawned.process.stdout?.once("data", () => controller.abort());
       return spawned;
     },
@@ -97,9 +164,11 @@ else { if(readFileSync('capture', 'utf8') !== 'recording bytes') throw Error('wr
       return {
         path: root.path,
         close: async () => {
+          keyLogCopiesAtClose.push(existsSync(join(root.path, "tls-key-log")));
           if (mode === "close-abort")
             controller.abort({ request: "cancel during workspace close" });
           if (!mayClean) throw new Error("cleanup fixture failure");
+          if (mode === "keylog-pin") await chmod(root.path, 0o700);
           await root.close();
         },
       };
@@ -111,6 +180,9 @@ else { if(readFileSync('capture', 'utf8') !== 'recording bytes') throw Error('wr
         await truncate(script, 64 * 1024 * 1024 + 1);
       }
       if (mode === "post-run-abort" && calls === 2) controller.abort();
+      // Abort only at the post-run key-log copy re-read.
+      if (mode === "keylog-abort" && args[0].endsWith("tls-key-log"))
+        controller.abort();
       return readStableArtifact(...args);
     },
     async (limits) => ({ ...limits, file_bytes: 1048576 }),
@@ -125,6 +197,8 @@ else { if(readFileSync('capture', 'utf8') !== 'recording bytes') throw Error('wr
     service,
     directory,
     path,
+    keyLogPath,
+    keyLogCopiesAtClose,
     controller,
     calls: () => calls,
     acquired: acquired.promise,
@@ -228,10 +302,258 @@ it("inspects an immutable copy, preserves options and warnings, and releases its
     "-e",
     "ip.addr",
   ]);
+  // Without a key log the report keeps its existing keys and limitations.
+  expect(Object.keys(result.value.normalized_result ?? {})).toEqual([
+    "artifact",
+    "selection",
+    "packets",
+    "output_window",
+    "read_scope",
+    "diagnostics",
+    "tool",
+    "configuration",
+    "resource_limiter",
+    "limits",
+    "hardware_acquisition",
+  ]);
+  expect(Object.keys(report.selection)).not.toContain("tls_key_log_path");
+  expect(result.value.limitations).toHaveLength(5);
+  expect(result.value.limitations.join(" ")).toContain("All stderr");
   expect((await readdir(f.directory)).sort()).toEqual([
+    "client keys.log",
     "producer.mjs",
     "recorded bytes.pcap",
   ]);
+});
+
+it("passes a private read-only key-log copy, reports counts without secrets and excludes credential fields", async () => {
+  const f = await fixture("keylog");
+  const result = await f.service.inspect({
+    path: f.path,
+    fields: keyLogFields,
+    tls_key_log_path: f.keyLogPath,
+  });
+  if (!result.ok) throw result.error;
+  const report = packetCaptureSchema.parse(result.value.normalized_result);
+  expect(report.tool.arguments).toEqual([
+    "-n",
+    "-r",
+    "capture",
+    "-T",
+    "json",
+    "--no-duplicate-keys",
+    "--temp-dir=.",
+    "-o",
+    expect.stringMatching(/^tls\.keylog_file:\/.*decoder-[^/]+\/tls-key-log$/u),
+    "-2",
+    ...["frame.number", ...keyLogFields].flatMap((field) => ["-e", field]),
+  ]);
+  // The secret copy is removed before workspace cleanup.
+  expect(f.keyLogCopiesAtClose).toEqual([false]);
+  expect(report.tls_key_log).toEqual({
+    path: f.keyLogPath,
+    sha256: createHash("sha256").update(keyLogText).digest("hex"),
+    bytes: Buffer.byteLength(keyLogText),
+    lines: { total: 5, comment_or_blank: 1, unrecognized: 1 },
+    labels: {
+      CLIENT_RANDOM: 1,
+      CLIENT_EARLY_TRAFFIC_SECRET: 0,
+      CLIENT_HANDSHAKE_TRAFFIC_SECRET: 0,
+      SERVER_HANDSHAKE_TRAFFIC_SECRET: 0,
+      CLIENT_TRAFFIC_SECRET_0: 1,
+      SERVER_TRAFFIC_SECRET_0: 1,
+      EARLY_EXPORTER_SECRET: 0,
+      EXPORTER_SECRET: 0,
+    },
+    client_randoms: { in_key_log: 2 },
+    secret_values: "not-returned",
+  });
+  expect(report.packets).toEqual([
+    { "frame.number": ["4"], "http2.headers.path": ["/v1/items"] },
+  ]);
+  expect(report.redactions).toEqual([
+    {
+      frame: "4",
+      field: "http2.headers.authorization",
+      reason: "transport-credential",
+    },
+    { frame: "4", field: "http.cookie", reason: "transport-credential" },
+  ]);
+  expect(report.diagnostics).toBe("");
+  expect(report.withheld_diagnostic_bytes).toBe(
+    Buffer.byteLength("producer warning\n"),
+  );
+  // The generic stderr-retention statement would contradict the withholding.
+  expect(result.value.limitations).toHaveLength(6);
+  expect(result.value.limitations.join(" ")).not.toContain("All stderr");
+  expect(result.value.limitations.join(" ")).toContain("stdout/stderr text");
+  expectNoKeyLogOrCredentialText(result.value);
+  expect(result.value.parameters).toMatchObject({
+    tls_key_log_path: f.keyLogPath,
+  });
+  expect((await readdir(f.directory)).sort()).toEqual([
+    "client keys.log",
+    "producer.mjs",
+    "recorded bytes.pcap",
+  ]);
+});
+
+it.each([
+  ["keylog-mutate", "AnalysisArtifactChangedError"],
+  ["keylog-nonzero", "ProviderAdapterError"],
+  ["keylog-invalid-json", "AnalysisOutputError"],
+  ["keylog-abort", "AnalysisCancelledError"],
+  ["keylog-overflow", "AnalysisResourceConstraintError"],
+  ["keylog-wait", "AnalysisCancelledError"],
+])(
+  "withholds decrypting output from %s failures and removes the key-log copy",
+  async (mode, tag) => {
+    const f = await fixture(mode);
+    const result = await f.service.inspect(
+      { path: f.path, fields: keyLogFields, tls_key_log_path: f.keyLogPath },
+      { signal: f.controller.signal },
+    );
+    if (result.ok) throw new Error("Expected key-log run failure");
+    expect(result.error._tag).toBe(tag);
+    if (mode === "keylog-wait" || mode === "keylog-abort")
+      expect(result.error.cause).toBe(f.controller.signal.reason);
+    if (mode === "keylog-abort")
+      expect(result.error.partialObservation).toMatchObject({
+        normalized_result: {
+          packets: [
+            { "frame.number": ["4"], "http2.headers.path": ["/v1/items"] },
+          ],
+          redactions: expect.arrayContaining([
+            expect.objectContaining({ field: "http2.headers.authorization" }),
+          ]),
+        },
+      });
+    // A nonzero exit reports its output through adapter diagnostics.
+    if (mode !== "keylog-abort")
+      expect(
+        result.error.capturedOutput ?? result.error.diagnostics,
+      ).toMatchObject({
+        stdout: "",
+        stderr: "",
+        stdout_bytes: expect.any(Number),
+        stderr_bytes: expect.any(Number),
+      });
+    // Interrupted runs keep the sizes of the withheld streams.
+    if (mode === "keylog-overflow" || mode === "keylog-wait")
+      expect(result.error.capturedOutput?.stdout_bytes).toBeGreaterThan(0);
+    expect(f.keyLogCopiesAtClose).toEqual([false]);
+    if (mode === "keylog-mutate")
+      expect(result.error).toMatchObject({
+        path: expect.stringMatching(/decoder-.*[/\\]tls-key-log$/u),
+      });
+    expectNoKeyLogOrCredentialText({
+      error: result.error,
+      projection: projectAnalysisError(result.error),
+    });
+    expect(result.error.cleanupIncomplete).toBe(false);
+    expect(
+      (await readdir(f.directory)).filter((name) =>
+        name.startsWith("decoder-"),
+      ),
+    ).toEqual([]);
+  },
+);
+
+it("removes the key-log copy even when workspace cleanup fails and ownership is retained", async () => {
+  const f = await fixture("keylog", true);
+  const result = await f.service.inspect({
+    path: f.path,
+    fields: keyLogFields,
+    tls_key_log_path: f.keyLogPath,
+  });
+  if (result.ok) throw new Error("Expected cleanup failure");
+  expect(result.error.cleanupIncomplete).toBe(true);
+  const retained = (await readdir(f.directory)).filter((name) =>
+    name.startsWith("decoder-"),
+  );
+  expect(retained).toHaveLength(1);
+  expect(await readdir(join(f.directory, retained[0] ?? ""))).not.toContain(
+    "tls-key-log",
+  );
+  expectNoKeyLogOrCredentialText({
+    error: result.error,
+    projection: projectAnalysisError(result.error),
+  });
+  f.allowCleanup();
+  await f.service.close();
+});
+
+it.skipIf(process.getuid?.() === 0)(
+  "recovers an early key-log unlink failure when the workspace owner removes the copy",
+  async () => {
+    const f = await fixture("keylog-pin");
+    const result = await f.service.inspect({
+      path: f.path,
+      fields: keyLogFields,
+      tls_key_log_path: f.keyLogPath,
+    });
+    if (!result.ok) throw result.error;
+    expect(result.value).toMatchObject({
+      normalized_result: {
+        packets: [
+          { "frame.number": ["4"], "http2.headers.path": ["/v1/items"] },
+        ],
+      },
+    });
+    expectNoKeyLogOrCredentialText(result.value);
+    expect(
+      (await readdir(f.directory)).filter((name) =>
+        name.startsWith("decoder-"),
+      ),
+    ).toEqual([]);
+  },
+);
+
+it("refuses unusable key logs with typed errors before running the producer", async () => {
+  const f = await fixture("keylog");
+  const directory = join(f.directory, "keys directory");
+  await mkdir(directory);
+  const oversized = join(f.directory, "oversized.keys");
+  await writeFile(oversized, "");
+  await truncate(oversized, TLS_KEY_LOG_MAX_BYTES + 1);
+  for (const [tls_key_log_path, expected] of [
+    [
+      directory,
+      {
+        _tag: "AnalysisInputError",
+        issues: [expect.objectContaining({ path: ["tls_key_log_path"] })],
+      },
+    ],
+    [
+      join(f.directory, "absent.keys"),
+      {
+        _tag: "AnalysisInputError",
+        issues: [expect.objectContaining({ path: ["tls_key_log_path"] })],
+      },
+    ],
+    [
+      oversized,
+      {
+        _tag: "AnalysisResourceConstraintError",
+        resource: "file-size",
+        reportedLimits: { tls_key_log_bytes: TLS_KEY_LOG_MAX_BYTES },
+      },
+    ],
+  ] as const) {
+    const before = f.calls();
+    const result = await f.service.inspect({
+      path: f.path,
+      fields: keyLogFields,
+      tls_key_log_path,
+    });
+    if (result.ok) throw new Error("Expected key-log refusal");
+    expect(result.error).toMatchObject(expected);
+    // Only the configuration probe ran; TShark never read the capture.
+    expect(f.calls() - before).toBe(1);
+  }
+  expect(
+    (await readdir(f.directory)).filter((name) => name.startsWith("decoder-")),
+  ).toEqual([]);
 });
 
 it.each([

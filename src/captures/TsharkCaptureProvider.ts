@@ -17,7 +17,7 @@ import {
 import { parsePacketOutput } from "./parsePacketOutput.js";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdir, realpath, writeFile } from "node:fs/promises";
+import { access, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import {
   createAnalysisExecution,
@@ -46,10 +46,18 @@ import {
 } from "../domain/analysisErrorCore.js";
 import { createEvidence } from "../domain/evidence.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import {
   type InspectPacketCaptureInput,
+  excludeTransportCredentialFields,
   packetCaptureSchema,
+  packetCaptureSelection,
 } from "../domain/captures/packetCapture.js";
+import {
+  TLS_KEY_LOG_MAX_BYTES,
+  summarizeTlsKeyLog,
+  type TlsKeyLogSummary,
+} from "../domain/captures/tlsKeyLog.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
   runOwnedCommand,
@@ -58,6 +66,49 @@ import {
 import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 
 const OPERATION = "inspect_packet_capture";
+const KEY_LOG_COPY = "tls-key-log";
+type Phase =
+  | "configuration"
+  | "artifact"
+  | "tls-key-log"
+  | "workspace"
+  | "producer"
+  | "integrity";
+
+/** Keep modeled process facts; raw causes and supervisors retain earlier output. */
+const withholdOutput = (failure: OwnedCommandFailure): OwnedCommandFailure =>
+  new OwnedCommandFailure(
+    failure.reason,
+    failure.message,
+    failure.snapshot === null
+      ? null
+      : {
+          ...failure.snapshot,
+          stdout: {
+            text: "",
+            bytes: 0,
+            observedBytes: failure.snapshot.stdout.observedBytes,
+          },
+          stderr: {
+            text: "",
+            bytes: 0,
+            observedBytes: failure.snapshot.stderr.observedBytes,
+          },
+        },
+    failure.cleanupFailure,
+    {
+      cancellation: failure.cancellation,
+      processError: failure.processError,
+      ...(failure.cleanupResult === undefined
+        ? {}
+        : { cleanupResult: failure.cleanupResult }),
+      collectionFailure: failure.collectionFailure,
+      ...(failure.preparationFailure === undefined
+        ? {}
+        : { preparationFailure: failure.preparationFailure }),
+    },
+    failure.resources,
+  );
 export const TSHARK_PROVIDER_IDENTITY = {
   id: "tshark-capture",
   name: "REA TShark capture adapter",
@@ -119,17 +170,33 @@ export class TsharkCaptureProvider implements PacketCapturePort {
     // TShark 4.6.9 emits a 22.3 MB glossary; keep capture output capped at 4 MiB.
     const limits =
       "path" in input ? LIMITS : { ...LIMITS, output_bytes: 32 * 1024 * 1024 };
-    let phase:
-      | "configuration"
-      | "artifact"
-      | "workspace"
-      | "producer"
-      | "integrity" = "configuration";
+    let phase: Phase = "configuration";
     let capturedOutput: AnalysisCapturedOutput | undefined;
     let resourcePath = "path" in input ? input.path : "TShark field glossary";
     let effectiveLimits: LinuxResourceLimits | undefined;
     let root: ArtifactAnalysisRuntime | undefined;
     let result: Result<AnalysisExecution, AnalysisError>;
+    // The private key-log copy holds session secrets; remove it as soon as the
+    // decrypting run is verified, and on every failure after it was written.
+    let keyLogCopy: string | undefined;
+    let keyLogCleanup: { path: string; system_code: string } | undefined;
+    let outputWithheld = false;
+    const removeKeyLogCopy = async (): Promise<void> => {
+      if (keyLogCopy === undefined) return;
+      const path = keyLogCopy;
+      keyLogCopy = undefined;
+      try {
+        await rm(path, { force: true });
+      } catch (cause: unknown) {
+        const code =
+          cause instanceof Error && "code" in cause
+            ? String(cause.code)
+            : "unknown";
+        // The runtime root still owns this path. Its final close can recover
+        // the unlink failure; only that owner's outcome establishes cleanup.
+        keyLogCleanup = { path, system_code: code };
+      }
+    };
     try {
       if (options?.signal?.aborted)
         throw new AnalysisCancelledError(operation, {
@@ -164,12 +231,32 @@ export class TsharkCaptureProvider implements PacketCapturePort {
       effectiveLimits = await this.#resources.readLimits(limits);
       const limitArguments = prlimitArgumentVector(effectiveLimits, command);
       phase = "workspace";
-      root = await this.createRuntime();
+      const workspace = await this.createRuntime();
+      root = {
+        path: workspace.path,
+        close: async () => {
+          try {
+            await workspace.close();
+          } catch (cause: unknown) {
+            if (keyLogCleanup === undefined) throw cause;
+            throw new ProviderCleanupError(
+              TSHARK_PROVIDER_IDENTITY.id,
+              [workspace.path],
+              {
+                reason: cause instanceof Error ? cause.message : String(cause),
+                key_log_path: keyLogCleanup.path,
+                key_log_unlink_code: keyLogCleanup.system_code,
+              },
+              { operation, cause },
+            );
+          }
+        },
+      };
       this.#resources.retain(root, undefined);
       const snapshotPath = join(root.path, "capture");
       const configurationPath = join(root.path, "configuration");
       await mkdir(configurationPath, { mode: 0o700 });
-      const execute = async (args: readonly string[]) => {
+      const execute = async (args: readonly string[], decrypting = false) => {
         capturedOutput = undefined;
         const output = await runOwnedCommand(
           {
@@ -194,10 +281,22 @@ export class TsharkCaptureProvider implements PacketCapturePort {
               : { signal: options.signal }),
             ...(this.launcher === undefined ? {} : { launcher: this.launcher }),
           },
-        );
+        ).catch((cause: unknown) => {
+          if (decrypting && cause instanceof OwnedCommandFailure)
+            outputWithheld = true;
+          throw cause;
+        });
+        // Decrypting output can carry credentials; keep only its sizes.
+        const text = decrypting
+          ? {
+              stdout: "",
+              stdout_bytes: output.stdout.observedBytes,
+              stderr: "",
+              stderr_bytes: output.stderr.observedBytes,
+            }
+          : { stdout: output.stdout.text, stderr: output.stderr.text };
         capturedOutput = {
-          stdout: output.stdout.text,
-          stderr: output.stderr.text,
+          ...text,
           truncated: output.diagnosticTruncated ?? false,
           exit_code: output.exitCode ?? null,
           signal: output.signal ?? null,
@@ -235,8 +334,7 @@ export class TsharkCaptureProvider implements PacketCapturePort {
             {
               diagnostics: {
                 exit_code: output.exitCode ?? null,
-                stdout: output.stdout.text,
-                stderr: output.stderr.text,
+                ...text,
               },
             },
           );
@@ -308,6 +406,34 @@ export class TsharkCaptureProvider implements PacketCapturePort {
           flag: "wx",
           mode: 0o400,
         });
+        const keyLogSnapshotPath = join(root.path, KEY_LOG_COPY);
+        let keyLog:
+          | ({ path: string; sha256: string; bytes: number } & TlsKeyLogSummary)
+          | undefined;
+        if (input.tls_key_log_path !== undefined) {
+          phase = "tls-key-log";
+          resourcePath = input.tls_key_log_path;
+          const source = await this.#resources.read(
+            input.tls_key_log_path,
+            TLS_KEY_LOG_MAX_BYTES,
+            options?.signal,
+          );
+          const summary = summarizeTlsKeyLog(source.bytes, operation);
+          if (!summary.ok) throw summary.error;
+          phase = "workspace";
+          keyLogCopy = keyLogSnapshotPath;
+          await writeFile(keyLogSnapshotPath, source.bytes, {
+            flag: "wx",
+            mode: 0o400,
+          });
+          keyLog = {
+            path: input.tls_key_log_path,
+            sha256: source.sha256,
+            bytes: source.bytes.length,
+            ...summary.value,
+          };
+          resourcePath = input.path;
+        }
         phase = "producer";
         const args = [
           "-n",
@@ -317,6 +443,10 @@ export class TsharkCaptureProvider implements PacketCapturePort {
           "json",
           "--no-duplicate-keys",
           "--temp-dir=.",
+          // Absolute, so resolution never depends on the working directory.
+          ...(keyLog === undefined
+            ? []
+            : ["-o", `tls.keylog_file:${keyLogSnapshotPath}`]),
           ...(input.two_pass ? ["-2"] : []),
           ...(input.packet_limit === null
             ? []
@@ -329,7 +459,7 @@ export class TsharkCaptureProvider implements PacketCapturePort {
             (field) => ["-e", field],
           ),
         ];
-        const output = await execute(args);
+        const output = await execute(args, keyLog !== undefined);
         phase = "integrity";
         resourcePath = snapshotPath;
         if (
@@ -342,27 +472,60 @@ export class TsharkCaptureProvider implements PacketCapturePort {
             "TShark changed the private capture copy.",
             capturedOutput === undefined ? {} : { capturedOutput },
           );
+        if (keyLog !== undefined) {
+          resourcePath = keyLogSnapshotPath;
+          if (
+            (
+              await this.#resources.read(
+                keyLogSnapshotPath,
+                TLS_KEY_LOG_MAX_BYTES,
+              )
+            ).sha256 !== keyLog.sha256
+          )
+            throw new AnalysisArtifactChangedError(
+              operation,
+              keyLogSnapshotPath,
+              "TShark changed the private TLS key log copy.",
+              capturedOutput === undefined ? {} : { capturedOutput },
+            );
+          await removeKeyLogCopy();
+        }
         phase = "producer";
         resourcePath = "path" in input ? input.path : command;
-        const matchingPackets = parsePacketOutput(
-          output.stdout.text,
-          input.fields,
-        );
+        let matchingPackets: ReturnType<typeof parsePacketOutput>;
+        try {
+          matchingPackets = parsePacketOutput(output.stdout.text, input.fields);
+        } catch (cause) {
+          // JSON and schema messages can quote producer text.
+          if (keyLog === undefined || cause instanceof AnalysisError)
+            throw cause;
+          throw new AnalysisOutputError(
+            operation,
+            "TShark returned malformed field output; decrypted output is withheld.",
+            capturedOutput === undefined ? {} : { capturedOutput },
+          );
+        }
         const start = Math.min(input.match_offset, matchingPackets.length);
         const end =
           input.match_limit === null
             ? matchingPackets.length
             : start +
               Math.min(input.match_limit, matchingPackets.length - start);
-        const packets = matchingPackets.slice(start, end);
+        const page = matchingPackets.slice(start, end);
+        const { packets, redactions } =
+          keyLog === undefined
+            ? { packets: page, redactions: undefined }
+            : excludeTransportCredentialFields(page);
         const report = packetCaptureSchema.parse({
           artifact: {
             path: input.path,
             sha256: selected.sha256,
             bytes: selected.bytes.length,
           },
-          selection: input,
+          ...(keyLog === undefined ? {} : { tls_key_log: keyLog }),
+          selection: packetCaptureSelection(input),
           packets,
+          ...(redactions === undefined ? {} : { redactions }),
           output_window: {
             matching_packets: matchingPackets.length,
             returned_packets: packets.length,
@@ -371,7 +534,10 @@ export class TsharkCaptureProvider implements PacketCapturePort {
           read_scope:
             input.packet_limit === null ? "to-eof" : "up-to-input-packet-limit",
           configuration: "private-empty-personal-profile",
-          ...metadata(args, output.stderr.text),
+          ...metadata(args, keyLog === undefined ? output.stderr.text : ""),
+          ...(keyLog === undefined
+            ? {}
+            : { withheld_diagnostic_bytes: output.stderr.observedBytes }),
         });
         result = ok(
           createAnalysisExecution(report, TSHARK_PROVIDER_IDENTITY, {
@@ -384,9 +550,14 @@ export class TsharkCaptureProvider implements PacketCapturePort {
             limitations: [
               "Fields are TShark dissector observations under the selected filter/decode-as/pass settings, not independently verified protocol semantics. Missing fields are absent from the producer output, not known zero or empty values.",
               "Packet limits count input packets before display filtering. Filtered results do not establish whole-capture or device traffic absence. Two-pass reassembly cannot recover bytes missing from the recording or beyond the read limit.",
-              "Repeated field values remain ordered string arrays; raw packet bytes are included only when explicitly selected as a supported field. Export index/score metadata are omitted. All stderr, including warnings on exit zero, is retained.",
+              `Repeated field values remain ordered string arrays; raw packet bytes are included only when explicitly selected as a supported field. Export index/score metadata are omitted.${keyLog === undefined ? " All stderr, including warnings on exit zero, is retained." : ""}`,
               "A private empty personal configuration is used. Installed libraries, global configuration and dissector plugins are trusted and not fully fingerprinted. File-only analysis and disabled name resolution do not constitute an OS sandbox.",
               "Linux prlimit enforces soft and hard ceilings before execution, preserving stricter inherited limits: at most 1 GiB address space per process, 64 MiB per file, 30 CPU seconds and no core dumps. Effective limits are reported. Resident input is capped at 32 MiB, each command at 30 wall-clock seconds and combined output at 4 MiB. Output overflow fails. These are per-process/per-file limits, not aggregate memory or filesystem quotas; caller-supplied tools and the limiter are trusted.",
+              ...(keyLog === undefined
+                ? []
+                : [
+                    "A private read-only copy of the caller's TLS key log was passed as tls.keylog_file; the workspace owns its removal and any cleanup retries. Its secrets, client randoms and line text are not returned, and producer stdout/stderr text is withheld from diagnostics (sizes are kept). Key-log counts are not compared with recorded handshakes and do not establish that any session was decrypted. Known Authorization, Proxy-Authorization, Cookie and Set-Cookie fields are removed from returned frames and listed in redactions; header lines, generic header values and payload bytes can still contain credentials when selected.",
+                  ]),
             ],
           }),
         );
@@ -400,7 +571,11 @@ export class TsharkCaptureProvider implements PacketCapturePort {
         this.#resources.retain(root, cause.cleanupOwner);
       result = err(
         this.#failure(
-          cause,
+          // Retain the exact supervisor privately before removing its public
+          // snapshot capability and raw cause wrappers from returned errors.
+          outputWithheld && cause instanceof OwnedCommandFailure
+            ? withholdOutput(cause)
+            : cause,
           phase,
           resourcePath,
           root?.path ?? null,
@@ -408,32 +583,31 @@ export class TsharkCaptureProvider implements PacketCapturePort {
           capturedOutput,
           operation,
           limits,
+          outputWithheld,
         ),
       );
     }
+    const observation = (execution: AnalysisExecution) =>
+      createEvidence(execution.subject ?? undefined, execution.provider, {
+        operation,
+        parameters: "path" in input ? packetCaptureSelection(input) : input,
+        result: execution.result,
+        confidence: "observed",
+        locations: execution.locations,
+        limitations: execution.limitations,
+      });
+    // Best effort on failure paths; the workspace owner retries on release.
+    await removeKeyLogCopy();
     return this.#resources.finish(
       result,
-      (execution) =>
-        createEvidence(execution.subject ?? undefined, execution.provider, {
-          operation,
-          parameters: input,
-          result: execution.result,
-          confidence: "observed",
-          locations: execution.locations,
-          limitations: execution.limitations,
-        }),
+      observation,
       operation,
       options?.signal,
     );
   }
   #failure(
     cause: unknown,
-    phase:
-      | "configuration"
-      | "artifact"
-      | "workspace"
-      | "producer"
-      | "integrity",
+    phase: Phase,
     path: string,
     workspacePath: string | null,
     effectiveLimits: LinuxResourceLimits | undefined,
@@ -443,6 +617,7 @@ export class TsharkCaptureProvider implements PacketCapturePort {
       readonly output_bytes: number;
       readonly command_timeout_ms: number;
     } = LIMITS,
+    outputWithheld = false,
   ): AnalysisError {
     if (cause instanceof AnalysisError) return cause;
     if (cause instanceof ArtifactReaderFailure && cause.cleanup !== undefined)
@@ -489,6 +664,7 @@ export class TsharkCaptureProvider implements PacketCapturePort {
         limits,
         effectiveLimits,
         operation,
+        outputWithheld,
       );
     if (phase === "workspace") {
       const code =
@@ -551,8 +727,10 @@ export class TsharkCaptureProvider implements PacketCapturePort {
           userMessage: `${reason} On Linux, configure TShark 4.x through REA_TSHARK_COMMAND and util-linux prlimit through REA_TSHARK_PRLIMIT_COMMAND (default /usr/bin/prlimit).`,
         },
       );
+    const keyLog = phase === "tls-key-log";
+    const selected = phase === "artifact" || keyLog;
     if (
-      phase === "artifact" &&
+      selected &&
       cause instanceof ArtifactReaderFailure &&
       cause.reason === "limit"
     )
@@ -560,7 +738,9 @@ export class TsharkCaptureProvider implements PacketCapturePort {
         operation,
         "file-size",
         reason,
-        { input_bytes: LIMITS.input_bytes },
+        keyLog
+          ? { tls_key_log_bytes: TLS_KEY_LOG_MAX_BYTES }
+          : { input_bytes: LIMITS.input_bytes },
         { cause },
       );
     if (cause instanceof ArtifactReaderFailure && cause.reason === "integrity")
@@ -568,7 +748,7 @@ export class TsharkCaptureProvider implements PacketCapturePort {
         cause,
       });
     if (
-      phase === "artifact" &&
+      selected &&
       cause instanceof Error &&
       "code" in cause &&
       (cause.code === "EACCES" || cause.code === "EPERM")
@@ -576,9 +756,13 @@ export class TsharkCaptureProvider implements PacketCapturePort {
       return new AnalysisAccessDeniedError(operation, path, cause.code, {
         cause,
       });
-    if (phase === "artifact")
+    if (selected)
       return new AnalysisInputError(operation, { cause }, [
-        { path: ["path"], reason: "invalid_value", message: reason },
+        {
+          path: [keyLog ? "tls_key_log_path" : "path"],
+          reason: "invalid_value",
+          message: reason,
+        },
       ]);
     return new AnalysisOutputError(operation, reason, {
       cause,

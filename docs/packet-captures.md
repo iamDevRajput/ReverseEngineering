@@ -119,6 +119,77 @@ These are not aggregate process-memory or filesystem quotas. The selected
 limiter is trusted; its path, digest and arguments are retained in Evidence.
 No arbitrary process flags are accepted.
 
+## Decrypt TLS with a caller-supplied key log
+
+When the caller's own client wrote an NSS key log while the capture was
+recorded (`SSLKEYLOGFILE` for Firefox and curl, `--ssl-key-log-file` for
+Chromium and Electron, `--tls-keylog` for Node), select it with
+`tls_key_log_path` (CLI `--tls_key_log_path`, resolved against the working
+directory). MCP requires an absolute path. The key log is read once (at most
+32 MiB, a regular file without a symlink) and copied read-only into the private
+workspace next to the capture copy. TShark receives the copy's absolute path as
+`-o tls.keylog_file:<private workspace>/tls-key-log` (one argv element, no
+shell), so `tool.arguments` names that private path. The copy's digest is
+rechecked after the run and deletion is attempted immediately afterwards, and on
+every failure after it was written, before workspace cleanup. The bounded
+integrity check finishes before honoring a late abort, preserving completed
+redacted observations. If early deletion fails, the workspace owner removes the
+copy during final cleanup. If that also fails, incomplete cleanup reports the
+path and system code, never contents, with any completed observation retained;
+a successful retry clears the original error's pending cleanup state. No other
+`-o` preference is accepted.
+
+```sh
+rea inspect-packet-capture /captures/electron.pcapng \
+  --fields http2.headers.method --fields http2.headers.path \
+  --fields http2.headers.status --display_filter http2.headers.path \
+  --tls_key_log_path /captures/electron.keys --format json
+```
+
+The report adds `tls_key_log` (path, SHA-256, size, line counts, counts for the
+eight NSS labels `CLIENT_RANDOM`, `CLIENT_EARLY_TRAFFIC_SECRET`,
+`CLIENT_HANDSHAKE_TRAFFIC_SECRET`, `SERVER_HANDSHAKE_TRAFFIC_SECRET`,
+`CLIENT_TRAFFIC_SECRET_0`, `SERVER_TRAFFIC_SECRET_0`, `EARLY_EXPORTER_SECRET`
+and `EXPORTER_SECRET`, distinct client randoms and `secret_values:
+"not-returned"`) and `redactions`. Secrets, client randoms and line text are
+never returned, logged or quoted in errors. Lines that do not match a label with
+a 32-byte hex client random and a hex secret of the expected length are counted
+as `unrecognized`; TShark applies its own parser and may still use them, for
+example `RSA` lines. Key-log counts are not compared with the recorded
+ClientHellos, so they do not establish that any session was decrypted; empty
+decrypted fields remain unknown, not absent.
+
+Known credential fields are removed from returned frames when a key log is
+selected, even if explicitly requested, and each removal is listed as
+`{ "frame", "field", "reason": "transport-credential" }`: `http.authorization`,
+`http.proxy_authorization`, `http.authbasic`, `http.authcitrix.*` subfields,
+`http.cookie`, `http.cookie_pair`, `http.set_cookie`, and the
+`authorization`, `proxy_authorization`, `cookie` and `set_cookie` fields under
+`http2.headers.*` and `http3.headers.*` (also with an `@` raw-byte prefix).
+Header lines (`http.request.line`), generic header values (`http2.header.value`),
+decoded authentication protocols and payload byte fields can still contain
+credentials when selected.
+
+A display filter could probe a removed value through match counts, so with a
+key log `display_filter` is refused (`AnalysisInputError` on `display_filter`)
+when its text contains any of the credential field names above, compared
+case-insensitively as substrings. This is deliberately conservative: it also
+rejects those names inside string literals. Filters over header lines or
+payload bytes (for example `http contains "Cookie"`) are not detected.
+
+Decrypting runs can report decrypted content in diagnostics, so TShark stdout
+and stderr text from the producer run is withheld: the report's `diagnostics`
+is empty and `withheld_diagnostic_bytes` gives the stderr size; failures keep
+exit status, signal and `stdout_bytes`/`stderr_bytes` but no text. To read
+TShark's message for an invalid filter or field, repeat the call without
+`tls_key_log_path`. The version probe's diagnostics are unaffected. Without
+`tls_key_log_path`, TShark arguments and the report are unchanged.
+
+Decryption depends on the installed TShark build; QUIC/HTTP/3 needs a build
+with HTTP/3 support. TShark can also use secrets embedded in pcapng Decryption
+Secrets Blocks, with or without a key log; REA does not detect or report them.
+MCP sessions retain decrypted field values in Evidence memory.
+
 ## Verification
 
 ```sh
@@ -131,6 +202,12 @@ It exercises real compiled CLI/MCP parity, advertised schemas, repeated/missing
 fields, filtering, decode-as, both pass modes, a packet limit before matching
 frames, Evidence persistence, failure diagnostics, source identity and cleanup.
 An optional positional REA entrypoint verifies an installed package.
+For key-log decryption it records owned Node TLS 1.3 and TLS 1.2 HTTP/1.1
+sessions (ephemeral `openssl` self-signed certificate) in synthetic TCP frames,
+omits one session's keys and adds unrelated and malformed key-log lines. It
+checks that HTTP fields are absent without the key log, decrypted URIs, status
+codes, redactions and key-log counts with it, and that no secret, client random
+or credential appears in CLI, MCP, Evidence bundle or error output.
 
 The real-tool lane requires Linux and TShark 4.x. A separate kernel-limit
 regression checks the inherited soft/hard limits and verifies an oversized

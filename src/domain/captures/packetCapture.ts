@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { fixedTupleSchema } from "../fixedTupleSchema.js";
 import { localPathStringSchema } from "../localPath.js";
+import { tlsKeyLogReportSchema } from "./tlsKeyLog.js";
 
 const argument = z
   .string()
@@ -58,6 +59,11 @@ const captureInputShape = z.strictObject({
     .describe(
       "Return at most this many matching packets after filtering; default 50. Null explicitly returns all remaining matches within producer resource limits.",
     ),
+  tls_key_log_path: localPathStringSchema
+    .optional()
+    .describe(
+      "Optional absolute local NSS key log (SSLKEYLOGFILE format) written by the caller's own TLS client. A private read-only copy is passed to TShark as tls.keylog_file and deleted after the run; secrets, client randoms and line text are never returned. Known authorization and cookie fields are then excluded from returned frames and listed in redactions, display filters naming them are refused, and producer stderr text is withheld.",
+    ),
 });
 // Bound UTF-8 selector text, terminators, option names and 64-bit argv pointers
 // before Set/flatMap expansion. 32 KiB reserves headroom below Linux execve's
@@ -82,23 +88,105 @@ export const packetCaptureSelectorBudgetIssue = {
   message:
     "Packet selectors exceed the 32 KiB encoded argument budget; reduce fields, decode-as rules or filter text.",
 };
-export const inspectPacketCaptureInputSchema = captureInputShape.refine(
-  withinPacketCaptureSelectorBudget,
-  packetCaptureSelectorBudgetIssue,
-);
+// Wireshark registrations carrying all or a decoded part of an Authorization,
+// Proxy-Authorization, Cookie or Set-Cookie header (HTTP/3 needs nghttp3).
+// Header lines, generic header values and payload bytes are not covered.
+const TRANSPORT_CREDENTIAL_FIELDS: ReadonlySet<string> = new Set([
+  "http.authorization",
+  "http.proxy_authorization",
+  "http.authbasic",
+  "http.authcitrix.user",
+  "http.authcitrix.domain",
+  "http.authcitrix.password",
+  "http.authcitrix.session",
+  "http.cookie",
+  "http.cookie_pair",
+  "http.set_cookie",
+  "http2.headers.authorization",
+  "http2.headers.proxy_authorization",
+  "http2.headers.cookie",
+  "http2.headers.set_cookie",
+  "http3.headers.authorization",
+  "http3.headers.proxy_authorization",
+  "http3.headers.cookie",
+  "http3.headers.set_cookie",
+]);
+
+/**
+ * Conservatively detect a display filter naming a credential field, including
+ * inside string literals or longer names. With a key log such a filter could
+ * probe redacted values through match counts.
+ */
+const referencesTransportCredentialField = (filter: string): boolean => {
+  const text = filter.toLowerCase();
+  return [...TRANSPORT_CREDENTIAL_FIELDS].some((field) => text.includes(field));
+};
+const credentialFilterIssue = {
+  path: ["display_filter"],
+  message:
+    "With tls_key_log_path, display_filter must not reference a redacted credential field (conservative name match).",
+};
+export const inspectPacketCaptureInputSchema = captureInputShape
+  .refine(withinPacketCaptureSelectorBudget, packetCaptureSelectorBudgetIssue)
+  .refine(
+    (input) =>
+      input.tls_key_log_path === undefined ||
+      input.display_filter === null ||
+      !referencesTransportCredentialField(input.display_filter),
+    credentialFilterIssue,
+  );
 export const packetCaptureOptionsSchema = captureInputShape
   .omit({ path: true })
   .refine(withinPacketCaptureSelectorBudget, packetCaptureSelectorBudgetIssue);
 export type InspectPacketCaptureInput = z.infer<
   typeof inspectPacketCaptureInputSchema
 >;
+/** One JSON selection: an unselected key log is absent, never an undefined key. */
+export const packetCaptureSelection = ({
+  tls_key_log_path,
+  ...selection
+}: InspectPacketCaptureInput) =>
+  tls_key_log_path === undefined
+    ? selection
+    : { ...selection, tls_key_log_path };
 
+const frameNumberSchema = z.string().regex(/^[1-9][0-9]*$/);
 /** Values remain strings; repeated occurrences remain ordered arrays. */
 export const packetFieldsSchema = z
   .object({
-    "frame.number": fixedTupleSchema([z.string().regex(/^[1-9][0-9]*$/)]),
+    "frame.number": fixedTupleSchema([frameNumberSchema]),
   })
   .catchall(z.array(z.string()));
+type PacketFields = z.infer<typeof packetFieldsSchema>;
+
+const packetRedactionSchema = z.strictObject({
+  frame: frameNumberSchema.describe("Original frame number"),
+  field: z.string().describe("Selected field removed from this frame"),
+  reason: z.literal("transport-credential"),
+});
+type PacketRedaction = z.infer<typeof packetRedactionSchema>;
+
+/** Remove known credential fields (including `@` raw-byte selections) from decrypted frames. */
+export const excludeTransportCredentialFields = (
+  packets: readonly PacketFields[],
+): { packets: PacketFields[]; redactions: PacketRedaction[] } => {
+  const redactions: PacketRedaction[] = [];
+  const retained = packets.map((packet) => {
+    const frame = packet["frame.number"][0];
+    return packetFieldsSchema.parse(
+      Object.fromEntries(
+        Object.entries(packet).filter(([field]) => {
+          if (!TRANSPORT_CREDENTIAL_FIELDS.has(field.replace(/^@/u, "")))
+            return true;
+          redactions.push({ frame, field, reason: "transport-credential" });
+          return false;
+        }),
+      ),
+    );
+  });
+  return { packets: retained, redactions };
+};
+
 export const packetCaptureSchema = z
   .strictObject({
     artifact: z.strictObject({
@@ -106,8 +194,19 @@ export const packetCaptureSchema = z
       sha256: z.string().regex(/^[a-f0-9]{64}$/),
       bytes: z.number().int().nonnegative(),
     }),
+    tls_key_log: tlsKeyLogReportSchema
+      .exactOptional()
+      .describe(
+        "Present only when tls_key_log_path is selected: key-log identity and line/label counts, never its contents. Counts do not establish that any recorded session was decrypted.",
+      ),
     selection: inspectPacketCaptureInputSchema,
     packets: z.array(packetFieldsSchema),
+    redactions: z
+      .array(packetRedactionSchema)
+      .exactOptional()
+      .describe(
+        "Present only when tls_key_log_path is selected: known credential fields removed from returned frames.",
+      ),
     output_window: z.strictObject({
       matching_packets: z
         .number()
@@ -121,6 +220,14 @@ export const packetCaptureSchema = z
     }),
     read_scope: z.enum(["to-eof", "up-to-input-packet-limit"]),
     diagnostics: z.string(),
+    withheld_diagnostic_bytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .exactOptional()
+      .describe(
+        "Present only when tls_key_log_path is selected: producer stderr bytes withheld because decrypting runs can report decrypted content; diagnostics is then empty.",
+      ),
     tool: z.strictObject({
       configured_path: z.string(),
       path: z.string(),
@@ -166,4 +273,37 @@ export const packetCaptureSchema = z
         message:
           "Returned packet window must match examined matches and caller-selected offset/limit",
       });
+    const keyLogPath = report.selection.tls_key_log_path;
+    if (
+      (keyLogPath === undefined) !== (report.tls_key_log === undefined) ||
+      (keyLogPath === undefined) !== (report.redactions === undefined) ||
+      (keyLogPath === undefined) !==
+        (report.withheld_diagnostic_bytes === undefined) ||
+      (keyLogPath !== undefined && report.diagnostics !== "") ||
+      (report.tls_key_log !== undefined &&
+        report.tls_key_log.path !== keyLogPath)
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["tls_key_log"],
+        message:
+          "Key-log identity, redactions and withheld diagnostics are reported exactly when tls_key_log_path is selected",
+      });
+    const returned = new Map(
+      report.packets.map((packet) => [packet["frame.number"][0], packet]),
+    );
+    for (const redaction of report.redactions ?? []) {
+      const packet = returned.get(redaction.frame);
+      if (
+        packet === undefined ||
+        Object.hasOwn(packet, redaction.field) ||
+        !report.selection.fields.includes(redaction.field)
+      )
+        context.addIssue({
+          code: "custom",
+          path: ["redactions"],
+          message:
+            "A redaction must name a selected field absent from a returned frame",
+        });
+    }
   });

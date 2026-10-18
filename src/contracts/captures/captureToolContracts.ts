@@ -31,7 +31,7 @@ export const CAPTURE_TOOL_CONTRACTS = [
     ...toolContractMetadata("inspect_packet_capture"),
     kind: "artifact-provider",
     description:
-      "Inspect caller-selected fields in an existing local packet capture with TShark 4.x. Return 50 matching frames by default, with match_offset/match_limit paging and coverage counts; match_limit:null requests all remaining matches. Preserve repeated values, frame numbers, display filter, decode-as rules and pass mode in inline Evidence with source/tool identity and diagnostics. Optional packet_limit counts input packets before filtering; output paging does not shorten dissection or two-pass reassembly. Requires Linux, util-linux prlimit, and absolute REA_TSHARK_COMMAND. File-only analysis; no live capture or device communication. Missing fields or no matches do not establish absence of device traffic.",
+      "Inspect caller-selected fields in an existing local packet capture with TShark 4.x. Return 50 matching frames by default, with match_offset/match_limit paging and coverage counts; match_limit:null requests all remaining matches. Preserve repeated values, frame numbers, display filter, decode-as rules and pass mode in inline Evidence with source/tool identity and diagnostics. Optional packet_limit counts input packets before filtering; output paging does not shorten dissection or two-pass reassembly. Requires Linux, util-linux prlimit, and absolute REA_TSHARK_COMMAND. File-only analysis; no live capture or device communication. Missing fields or no matches do not establish absence of device traffic. Optional tls_key_log_path supplies the caller's NSS key log (SSLKEYLOGFILE) so TShark can decrypt recorded TLS; only its identity and line/label counts are returned, and known authorization/cookie fields are removed and listed in redactions.",
     inputSchema: inspectPacketCaptureInputSchema,
     outputSchema: evidenceResultOf(packetCaptureSchema),
     examples: [
@@ -44,6 +44,15 @@ export const CAPTURE_TOOL_CONTRACTS = [
           decode_as: [],
           packet_limit: null,
           two_pass: true,
+        },
+      },
+      {
+        title: "Inspect HTTP/2 requests in a recording with its TLS key log",
+        input: {
+          path: "/captures/electron.pcapng",
+          fields: ["http2.headers.method", "http2.headers.path"],
+          display_filter: "http2.headers.path",
+          tls_key_log_path: "/captures/electron.keys",
         },
       },
     ],
