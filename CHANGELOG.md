@@ -1,5 +1,13 @@
 # Changelog
 
+## [6.7.0](https://github.com/morluto/rea/compare/rea-agents-6.6.0...rea-agents-6.7.0) (2026-10-18)
+
+
+### Bug Fixes
+
+* **tests:** budget CLI coverage from parsed options ([6b18078](https://github.com/morluto/rea/commit/6b180783ed04ebc87548c8385c80e05725804c47)), closes [#4960](https://github.com/morluto/rea/issues/4960)
+* **tests:** isolate command finalization module mocks ([8cbaf6c](https://github.com/morluto/rea/commit/8cbaf6c7021b97dd4de6b5771c35fbed06b240e9)), closes [#4959](https://github.com/morluto/rea/issues/4959)
+
 ## [6.6.0](https://github.com/morluto/rea/compare/rea-agents-6.5.0...rea-agents-6.6.0) (2026-10-18)
 
 ### Highlights
