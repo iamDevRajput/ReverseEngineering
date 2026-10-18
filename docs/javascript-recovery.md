@@ -7,7 +7,9 @@ never executes the selected or recovered application code.
 
 ## Caller-supplied engine
 
-REA accepts Wakaru **^1.13.0** on Linux x64. The report parser is verified with
+REA accepts Wakaru **^1.13.0** on any host that can execute the configured binary;
+**Linux x64 is the only fully verified host** and other hosts are reported as
+unverified. The report parser is verified with
 Wakaru **1.14.0**. Another release in that range is accepted, the observed
 version is reported, and a limitation records that the parser was not verified
 against that release. Wakaru changes `--version`, `--json` and `provenance.json`
@@ -17,8 +19,10 @@ so the parser keeps unknown report fields and reported module statuses.
 
 Set `REA_WAKARU_COMMAND` to the absolute path of an executable supplied by the
 caller. The adapter uses util-linux `prlimit` (default `/usr/bin/prlimit`;
-override with an absolute `REA_JAVASCRIPT_PRLIMIT_COMMAND`). REA does not install
-either tool. Engine configuration is checked only when recovery is requested;
+override with an absolute `REA_JAVASCRIPT_PRLIMIT_COMMAND`). On hosts without
+util-linux, point that variable at a wrapper that accepts the same flags (for
+example `--as= --fsize= --core= --cpu= -- command args...`) and maps them to
+the local `ulimit` equivalents; REA does not install either tool. Engine configuration is checked only when recovery is requested;
 other REA capabilities remain available without it.
 
 Unmodified upstream source is retained in `third_party/wakaru`, pinned to

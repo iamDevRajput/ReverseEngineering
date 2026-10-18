@@ -22,11 +22,11 @@ import {
   fingerprintRecoveryFile,
   recoveryFailureMessage,
 } from "./RecoveryFiles.js";
-import { RECOVERY_LIMITS } from "./WakaruRelease.js";
+import { RECOVERY_LIMITS, wakaruHost } from "./WakaruRelease.js";
 
 const OPERATION = "recover_javascript_sources";
 const WAKARU_REQUIREMENT =
-  "Provide an absolute REA_WAKARU_COMMAND pointing to a Wakaru ^1.13.0 Linux x64 binary (verified with 1.14.0); no tool is installed by REA. See docs/javascript-recovery.md#install-wakaru.";
+  "Provide an absolute REA_WAKARU_COMMAND pointing to a Wakaru ^1.13.0 binary (verified with 1.14.0); no tool is installed by REA. Linux x64 is the fully verified host; other hosts run the same protocol against the configured binary and are reported as unverified, and need REA_JAVASCRIPT_PRLIMIT_COMMAND pointing at a prlimit-compatible wrapper because util-linux is Linux-only. See docs/javascript-recovery.md#install-wakaru.";
 
 /** Inject the owned process launcher while retaining production protocol parsing. */
 export type WakaruLauncher = (
@@ -63,12 +63,7 @@ export const resolveWakaruCommand = async (
   environment: Readonly<Record<string, string | undefined>>,
 ) => {
   const configured = environment.REA_WAKARU_COMMAND;
-  if (
-    process.platform !== "linux" ||
-    process.arch !== "x64" ||
-    configured === undefined ||
-    !isAbsolute(configured)
-  )
+  if (configured === undefined || !isAbsolute(configured))
     throw new AnalysisCapabilityUnavailableError(
       "wakaru",
       OPERATION,
@@ -89,9 +84,9 @@ export const resolveWakaruCommand = async (
     await access(limiter, constants.X_OK);
     if (!(await stat(limiter)).isFile())
       throw new TypeError(`Resource limiter is not a regular file: ${limiter}`);
-    return { command, limiter, ...fingerprint };
+    return { command, limiter, host: wakaruHost(), ...fingerprint };
   } catch (cause: unknown) {
-    const reason = `Configured Wakaru or util-linux prlimit is unavailable: ${recoveryFailureMessage(cause)}`;
+    const reason = `Configured Wakaru or resource limiter is unavailable: ${recoveryFailureMessage(cause)}`;
     throw new AnalysisCapabilityUnavailableError("wakaru", OPERATION, reason, {
       cause,
       userMessage: reason,
@@ -138,7 +133,7 @@ export const runWakaruCommand = async (context: WakaruCommandContext) => {
     throw new ProviderAdapterError("wakaru", OPERATION, {
       cause,
       diagnostics: {
-        reason: "Failed to launch configured Wakaru through util-linux prlimit",
+        reason: "Failed to launch configured Wakaru through the configured resource limiter",
         command: context.command,
         detail: recoveryFailureMessage(cause),
       },

@@ -30,11 +30,42 @@ export const RECOVERY_LIMITS = {
   timeoutMs: 120000,
 } as const;
 
+/** The only host whose adapter behaviour is fully verified; every other host runs unverified. */
+export const WAKARU_VERIFIED_HOST = { platform: "linux", arch: "x64" } as const;
+
+/** Host identity carried through resolution so results can disclose verification state. */
+export type WakaruHost = {
+  platform: string;
+  arch: string;
+  verified: boolean;
+};
+
+export const wakaruHost = (
+  platform: string = process.platform,
+  arch: string = process.arch,
+): WakaruHost => ({
+  platform,
+  arch,
+  verified:
+    platform === WAKARU_VERIFIED_HOST.platform &&
+    arch === WAKARU_VERIFIED_HOST.arch,
+});
+
 /** Public limitations for transformations and extraction provenance. */
 export const RECOVERY_LIMITATIONS = [
   "Recovered sources are derived artifacts; original variable names and runtime equivalence are not established.",
   "Extraction ranges refer to half-open UTF-8 byte offsets in the original input, not rewritten line positions or whole-bundle coverage.",
   "Emitted source maps are preserved as reported by the engine; their mapping accuracy is not independently established.",
   "Inspection mode may produce non-executable regions. No input or recovered application code is executed.",
-  "Linux adapter: one worker, 1 GiB address-space ceiling, 120-second deadline, 64 MiB total input, 128 MiB output, 10000 output entries and 8 MiB per diagnostic/report stream. Resource limits are per operation, not aggregate host containment.",
 ] as const;
+
+/**
+ * Resource disclosure. The 1 GiB address-space ceiling only exists where the
+ * configured limiter can express util-linux `--as`; elsewhere it is dropped and
+ * the result must say so rather than advertise a ceiling that is not enforced.
+ */
+export const recoveryLimitationsFor = (host: WakaruHost): readonly string[] => [
+  host.verified
+    ? `${host.platform}-${host.arch} (verified adapter): one worker, 1 GiB address-space ceiling, 120-second deadline, 64 MiB total input, 128 MiB output, 10000 output entries and 8 MiB per diagnostic/report stream. Resource limits are per operation, not aggregate host containment.`
+    : `${host.platform}-${host.arch} (unverified host): the 1 GiB address-space ceiling is NOT enforced because the configured resource limiter cannot map util-linux --as; one worker, 120-second deadline, 64 MiB total input, 128 MiB output, 10000 output entries and 8 MiB per diagnostic/report stream still apply. Resource limits are per operation, not aggregate host containment.`,
+];
