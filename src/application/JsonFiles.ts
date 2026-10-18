@@ -7,7 +7,7 @@ import {
   rename,
   type FileHandle,
 } from "node:fs/promises";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, resolve, sep } from "node:path";
 
 import {
   EvidenceFileError,
@@ -23,6 +23,7 @@ import {
   readJsonObjectFile,
   type JsonObjectMemberReader,
 } from "./JsonInputFile.js";
+import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import { NonRegularFileReadError } from "../filesystem/RegularFile.js";
 import { RegularFileCleanupFailure } from "./RegularFileRead.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
@@ -94,7 +95,7 @@ const readJsonFileInput = async <Value>(
 ): Promise<
   Result<Value, EvidenceFileError | AnalysisResourceConstraintError>
 > => {
-  const requestedPath = resolve(path);
+  const requestedPath = absoluteCallerPath(path);
   try {
     const decoded = await read(requestedPath);
     if (!decoded.ok) {
@@ -173,7 +174,7 @@ export function writeTextParts(
       return err(
         new EvidenceFileError("write", "io", {
           cause,
-          path: resolve(path),
+          path: absoluteCallerPath(path),
           ...(cleanup === undefined ? {} : { cleanup }),
         }),
       );
@@ -187,11 +188,19 @@ const writeTextPartsOwned = async (
   resources: ArtifactResourceScope,
   cancellation?: TextWriteCancellation,
 ): Promise<TextWriteResult> => {
-  const requestedPath = resolve(path);
+  const requestedPath = absoluteCallerPath(path);
   try {
     assertWriteActive(cancellation);
+    const name = basename(requestedPath);
+    // The shared path owner retains a trailing separator for "/" and "/.".
+    // Reject directory selections before splitting: realpath("file") succeeds,
+    // so dropping that separator could publish over the selected regular file.
+    if (requestedPath.endsWith(sep) || name === "..")
+      return err(
+        new EvidenceFileError("write", "not-file", { path: requestedPath }),
+      );
     const canonicalParent = await realpath(dirname(requestedPath));
-    const destination = resolve(canonicalParent, basename(requestedPath));
+    const destination = resolve(canonicalParent, name);
     const existing = await lstat(destination).catch((cause: unknown) => {
       if (fileErrorCode(cause) === "ENOENT") return undefined;
       throw cause;
